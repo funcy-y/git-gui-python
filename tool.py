@@ -2,6 +2,7 @@
 import sys
 import os
 import json
+import time
 from datetime import datetime
 from PyQt5.QtCore import Qt, QRunnable, QThreadPool, pyqtSignal, QObject, QTimer
 from PyQt5.QtWidgets import (
@@ -10,7 +11,7 @@ from PyQt5.QtWidgets import (
     QMessageBox, QInputDialog, QLabel, QGroupBox, QSplitter,
     QTableWidget, QTableWidgetItem, QHeaderView, QComboBox, QLineEdit,
     QAbstractItemView, QFormLayout, QDialog, QTabWidget, QTextBrowser,
-    QMenu, QAction, QCheckBox, QProgressBar
+    QMenu, QAction, QCheckBox, QProgressBar, QDialogButtonBox
 )
 from PyQt5.QtGui import QColor, QFont
 from git import Repo, InvalidGitRepositoryError, GitCommandError, RemoteProgress
@@ -24,16 +25,21 @@ class GitProgressHandler(RemoteProgress):
     def __init__(self, signals):
         super().__init__()
         self.signals = signals
+        self.last_update = 0
 
     def update(self, op_code, cur_count, max_count=None, message=''):
-        # 发送进度信息
-        if message:
-            self.signals.progress.emit(message)
-        elif max_count and max_count > 0:
-            percentage = (cur_count / max_count) * 100
-            self.signals.progress.emit(f"进度: {percentage:.1f}%")
-        else:
-            self.signals.progress.emit("处理中...")
+        # 限制进度更新频率，避免过于频繁的UI更新
+        current_time = time.time()
+        if current_time - self.last_update > 0.5 or message:
+            # 发送进度信息
+            if message:
+                self.signals.progress.emit(message)
+            elif max_count and max_count > 0:
+                percentage = (cur_count / max_count) * 100
+                self.signals.progress.emit(f"进度: {percentage:.1f}%")
+            else:
+                self.signals.progress.emit("处理中...")
+            self.last_update = current_time
 
 
 class GitWorkerSignals(QObject):
@@ -54,8 +60,15 @@ class GitWorker(QRunnable):
         self.signals = GitWorkerSignals()
 
     def run(self):
+        start_time = time.time()
         try:
+            # 记录Git仓库初始化时间
+            repo_init_start = time.time()
             repo = Repo(self.repo_path)
+            repo_init_time = time.time() - repo_init_start
+            print(f"Git repository initialization took {repo_init_time:.2f} seconds")
+
+            operation_start = time.time()
 
             if self.operation == "status":
                 status_result = []
@@ -129,11 +142,18 @@ class GitWorker(QRunnable):
                 self.signals.result.emit(f"提交成功: {message}")
 
             elif self.operation == "push":
+                # 设置Git配置优化
+                repo.git.config('http.lowSpeedLimit', '1000')
+                repo.git.config('http.lowSpeedTime', '30')
+
                 origin = repo.remote(name='origin')
                 progress_handler = GitProgressHandler(self.signals)
 
                 try:
+                    push_start = time.time()
                     origin.push(progress=progress_handler)
+                    push_time = time.time() - push_start
+                    print(f"Push operation took {push_time:.2f} seconds")
                     self.signals.result.emit("推送成功")
                 except GitCommandError as e:
                     # 检查是否是因为没有设置上游分支
@@ -150,6 +170,10 @@ class GitWorker(QRunnable):
                         self.signals.error.emit(str(e))
 
             elif self.operation == "push_with_upstream":
+                # 设置Git配置优化
+                repo.git.config('http.lowSpeedLimit', '1000')
+                repo.git.config('http.lowSpeedTime', '30')
+
                 # 推送并设置上游分支
                 origin = repo.remote(name='origin')
                 progress_handler = GitProgressHandler(self.signals)
@@ -165,6 +189,10 @@ class GitWorker(QRunnable):
                     self.signals.error.emit(str(e))
 
             elif self.operation == "pull":
+                # 设置Git配置优化
+                repo.git.config('http.lowSpeedLimit', '1000')
+                repo.git.config('http.lowSpeedTime', '30')
+
                 origin = repo.remote(name='origin')
 
                 # 获取拉取选项参数
@@ -180,7 +208,10 @@ class GitWorker(QRunnable):
                 progress_handler = GitProgressHandler(self.signals)
                 pull_kwargs['progress'] = progress_handler
 
+                pull_start = time.time()
                 origin.pull(**pull_kwargs)
+                pull_time = time.time() - pull_start
+                print(f"Pull operation took {pull_time:.2f} seconds")
                 self.signals.result.emit("拉取成功")
 
             elif self.operation == "checkout":
@@ -281,8 +312,100 @@ class GitWorker(QRunnable):
                     repo.git.branch('-d', branch_name)
                     self.signals.result.emit(f"分支 '{branch_name}' 已删除")
 
+            operation_time = time.time() - operation_start
+            total_time = time.time() - start_time
+            print(f"Git operation '{self.operation}' took {operation_time:.2f} seconds")
+            print(f"Total worker execution time: {total_time:.2f} seconds")
+
         except Exception as e:
             self.signals.error.emit(str(e))
+
+
+class CloneDialog(QDialog):
+    """克隆仓库对话框"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.repo_url = None
+        self.local_path = None
+        self.init_ui()
+        self.setWindowTitle("克隆远程仓库")
+        self.resize(500, 200)
+
+    def init_ui(self):
+        layout = QVBoxLayout()
+
+        # 仓库URL输入
+        url_layout = QHBoxLayout()
+        url_layout.addWidget(QLabel("仓库URL:"))
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("例如: https://github.com/user/repo.git")
+        url_layout.addWidget(self.url_input)
+        layout.addLayout(url_layout)
+
+        # 本地路径选择
+        path_layout = QHBoxLayout()
+        path_layout.addWidget(QLabel("本地路径:"))
+        self.path_input = QLineEdit()
+        self.path_input.setPlaceholderText("选择本地目录存放克隆的仓库")
+        path_layout.addWidget(self.path_input)
+        self.browse_btn = QPushButton("浏览")
+        self.browse_btn.clicked.connect(self.browse_path)
+        path_layout.addWidget(self.browse_btn)
+        layout.addLayout(path_layout)
+
+        # 按钮
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        self.clone_btn = QPushButton("克隆")
+        self.clone_btn.clicked.connect(self.accept)
+        button_layout.addWidget(self.clone_btn)
+        self.cancel_btn = QPushButton("取消")
+        self.cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(self.cancel_btn)
+        layout.addLayout(button_layout)
+
+        self.setLayout(layout)
+
+    def browse_path(self):
+        """浏览本地路径"""
+        directory = QFileDialog.getExistingDirectory(self, "选择本地目录")
+        if directory:
+            self.path_input.setText(directory)
+
+    def accept(self):
+        """确认克隆"""
+        self.repo_url = self.url_input.text().strip()
+        self.local_path = self.path_input.text().strip()
+
+        if not self.repo_url:
+            QMessageBox.warning(self, "警告", "请输入仓库URL")
+            return
+
+        if not self.local_path:
+            QMessageBox.warning(self, "警告", "请选择本地路径")
+            return
+
+        # 检查本地路径是否存在
+        if not os.path.exists(self.local_path):
+            QMessageBox.warning(self, "警告", "本地路径不存在")
+            return
+
+        # 获取仓库名称
+        repo_name = self.repo_url.split('/')[-1].replace('.git', '')
+        self.clone_target_path = os.path.join(self.local_path, repo_name)
+
+        # 检查目标路径是否已存在
+        if os.path.exists(self.clone_target_path):
+            reply = QMessageBox.question(
+                self, "确认",
+                f"目录 {self.clone_target_path} 已存在，是否继续克隆？",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+
+        super().accept()
 
 
 class DiffDialog(QDialog):
@@ -433,6 +556,26 @@ class CommitDetailDialog(QDialog):
         self.files_tabs.addTab(tab, tab_title)
 
 
+class CloneWorker(QRunnable):
+    """克隆仓库工作线程"""
+
+    def __init__(self, repo_url, local_path, clone_target_path):
+        super().__init__()
+        self.repo_url = repo_url
+        self.local_path = local_path
+        self.clone_target_path = clone_target_path
+        self.signals = GitWorkerSignals()
+
+    def run(self):
+        try:
+            # 使用GitPython克隆仓库
+            progress_handler = GitProgressHandler(self.signals)
+            repo = Repo.clone_from(self.repo_url, self.clone_target_path, progress=progress_handler)
+            self.signals.result.emit(f"仓库克隆成功: {self.clone_target_path}")
+        except Exception as e:
+            self.signals.error.emit(str(e))
+
+
 class GitManager(QWidget):
     def __init__(self):
         super().__init__()
@@ -440,6 +583,8 @@ class GitManager(QWidget):
         self.current_repo = None
         self.current_repo_path = None
         self.threadpool = QThreadPool()
+        # 设置线程池最大线程数
+        self.threadpool.setMaxThreadCount(5)
         self.active_operations = set()  # 跟踪正在进行的操作
         self.init_ui()
         self.load_config()
@@ -458,14 +603,14 @@ class GitManager(QWidget):
         self.add_repo_btn.clicked.connect(self.add_repo)
         self.remove_repo_btn = QPushButton("移除仓库")
         self.remove_repo_btn.clicked.connect(self.remove_repo)
-        self.add_remote_btn = QPushButton("添加远程仓库")  # 新增按钮
-        self.add_remote_btn.clicked.connect(self.add_remote)  # 连接点击事件
+        self.clone_repo_btn = QPushButton("克隆仓库")  # 新增按钮
+        self.clone_repo_btn.clicked.connect(self.clone_repo)  # 连接点击事件
         self.refresh_btn = QPushButton("刷新")
         self.refresh_btn.clicked.connect(self.refresh_current_repo)
 
         top_layout.addWidget(self.add_repo_btn)
         top_layout.addWidget(self.remove_repo_btn)
-        top_layout.addWidget(self.add_remote_btn)  # 添加到顶部按钮区域
+        top_layout.addWidget(self.clone_repo_btn)  # 添加到顶部按钮区域
         top_layout.addWidget(self.refresh_btn)
         top_layout.addStretch()
         main_layout.addLayout(top_layout)
@@ -694,7 +839,7 @@ class GitManager(QWidget):
         self.create_branch_btn.setEnabled(has_repo)
         self.merge_combo.setEnabled(has_repo)
         self.merge_btn.setEnabled(has_repo)
-        self.add_remote_btn.setEnabled(has_repo)
+        self.clone_repo_btn.setEnabled(True)  # 克隆按钮始终可用
         self.delete_branch_btn.setEnabled(has_repo)
 
     def load_config(self):
@@ -860,19 +1005,39 @@ class GitManager(QWidget):
             self.log_message("请先选择一个仓库")
             return
 
+        # 立即提供反馈
+        self.log_message(f"准备执行 {operation} 操作...")
+
         worker = GitWorker(self.current_repo_path, operation, *args)
         if callback:
             worker.signals.result.connect(callback)
         worker.signals.error.connect(self.handle_git_error)
         worker.signals.progress.connect(self.log_message)
         self.threadpool.start(worker)
+        # 强制处理事件以立即显示日志
+        QApplication.processEvents()
 
     def handle_git_error(self, error_msg):
         """处理Git操作错误"""
         self.log_message(f"操作失败: {error_msg}")
 
+        # 检查是否是由于本地更改导致的分支切换失败
+        if "Your local changes to the following files would be overwritten by checkout" in error_msg and "Please commit your changes or stash them before you switch branches" in error_msg:
+            # 显示专门的错误对话框，提供解决方案
+            msg_box = QMessageBox(self)
+            msg_box.setIcon(QMessageBox.Warning)
+            msg_box.setWindowTitle("分支切换失败")
+            msg_box.setText("分支切换失败：您有未提交的更改")
+            msg_box.setInformativeText(
+                "您可以选择以下解决方案：\n\n"
+                "1. 暂存更改并在切换分支后恢复\n"
+                "2. 丢弃所有未提交的更改\n"
+                "3. 提交更改后再切换分支"
+            )
+            msg_box.setDetailedText(error_msg)
+            msg_box.exec_()
         # 检查是否是没有上游分支的错误
-        if "has no upstream branch" in error_msg:
+        elif "has no upstream branch" in error_msg:
             # 显示专门的错误对话框，提供解决方案
             msg_box = QMessageBox(self)
             msg_box.setIcon(QMessageBox.Warning)
@@ -910,7 +1075,7 @@ class GitManager(QWidget):
         self.set_button_loading(self.push_set_upstream_btn, False)
         self.set_button_loading(self.create_branch_btn, False)
         self.set_button_loading(self.merge_btn, False)
-        self.set_button_loading(self.add_remote_btn, False)
+        self.set_button_loading(self.clone_repo_btn, False)
         self.set_button_loading(self.delete_branch_btn, False)
 
         # 重置组合框
@@ -983,7 +1148,7 @@ class GitManager(QWidget):
         self.switch_branch(branch_name)
 
     def switch_branch(self, branch_name):
-        """切换分支"""
+        """切换分支 - 直接携带更改到新分支"""
         if not branch_name:
             return
 
@@ -994,6 +1159,27 @@ class GitManager(QWidget):
                 combo_text = self.branch_combo.itemText(i)
                 break
 
+        self.active_operations.add("switch_branch")
+        self.set_combo_loading(self.branch_combo, True)
+
+        def on_checkout_result(result):
+            self.log_message(result)
+            self.refresh_current_repo()
+            self.active_operations.discard("switch_branch")
+            self.set_combo_loading(self.branch_combo, False)
+
+        def on_checkout_error(error_msg):
+            self.log_message(f"切换分支失败: {error_msg}")
+            # 如果是由于本地更改导致的切换失败，显示详细信息
+            if "Your local changes to the following files would be overwritten by checkout" in error_msg:
+                QMessageBox.critical(self, "切换分支失败",
+                                   f"无法将更改带到新分支，因为以下文件存在冲突：\n\n{error_msg}")
+            self.active_operations.discard("switch_branch")
+            self.set_combo_loading(self.branch_combo, False)
+            # 刷新当前状态以确保UI同步
+            self.refresh_current_repo()
+
+        # 直接执行分支切换，尝试携带更改
         if combo_text.startswith("remote: "):
             # 这是一个远程分支，需要创建本地跟踪分支
             # 提取分支名，例如从 "origin/feature/new-feature" 提取 "feature/new-feature"
@@ -1015,29 +1201,17 @@ class GitManager(QWidget):
 
             if not local_branch_exists:
                 # 创建本地跟踪分支
-                self.active_operations.add("switch_branch")
-                self.set_combo_loading(self.branch_combo, True)
+                worker = GitWorker(self.current_repo_path, "checkout", "-b", actual_branch_name, branch_name)
+            else:
+                # 直接切换到已存在的本地分支
+                worker = GitWorker(self.current_repo_path, "checkout", actual_branch_name)
+        else:
+            # 切换到本地分支
+            worker = GitWorker(self.current_repo_path, "checkout", branch_name)
 
-                def on_checkout_result(result):
-                    self.log_message(result)
-                    self.refresh_current_repo()
-                    self.active_operations.discard("switch_branch")
-                    self.set_combo_loading(self.branch_combo, False)
-
-                # 使用 checkout -b 命令创建并切换到新分支
-                self.execute_git_task("checkout", "-b", actual_branch_name, branch_name, callback=on_checkout_result)
-                return
-
-        self.active_operations.add("switch_branch")
-        self.set_combo_loading(self.branch_combo, True)
-
-        def on_checkout_result(result):
-            self.log_message(result)
-            self.refresh_current_repo()
-            self.active_operations.discard("switch_branch")
-            self.set_combo_loading(self.branch_combo, False)
-
-        self.execute_git_task("checkout", branch_name, callback=on_checkout_result)
+        worker.signals.result.connect(on_checkout_result)
+        worker.signals.error.connect(on_checkout_error)
+        self.threadpool.start(worker)
 
     def create_branch(self):
         """创建新分支"""
@@ -1503,38 +1677,42 @@ class GitManager(QWidget):
             worker.signals.error.connect(on_checkout_error)
             self.threadpool.start(worker)
 
-    def add_remote(self):
-        """添加远程仓库"""
-        if not self.current_repo_path:
-            self.log_message("请先选择一个仓库")
+    def clone_repo(self):
+        """克隆远程仓库"""
+        if "clone_repo" in self.active_operations:
             return
 
-        # 获取远程仓库名称和URL
-        remote_name, ok1 = QInputDialog.getText(self, "添加远程仓库", "远程仓库名称:")
-        if not ok1 or not remote_name.strip():
-            return
+        # 创建克隆对话框
+        dialog = CloneDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.active_operations.add("clone_repo")
+            self.set_button_loading(self.clone_repo_btn, True)
 
-        remote_url, ok2 = QInputDialog.getText(self, "添加远程仓库", "远程仓库URL:")
-        if not ok2 or not remote_url.strip():
-            return
+            # 创建克隆工作线程
+            worker = CloneWorker(dialog.repo_url, dialog.local_path, dialog.clone_target_path)
+            worker.signals.result.connect(self.on_clone_success)
+            worker.signals.error.connect(self.on_clone_error)
+            worker.signals.progress.connect(self.log_message)
+            self.threadpool.start(worker)
 
-        remote_name = remote_name.strip()
-        remote_url = remote_url.strip()
+    def on_clone_success(self, result):
+        """克隆成功回调"""
+        self.log_message(result)
+        # 将克隆的仓库添加到配置中
+        repo_path = result.split(": ")[-1]  # 提取路径
+        if repo_path not in self.repo_paths:
+            self.repo_paths.append(repo_path)
+            self.save_config()
+            self.update_repo_list()
+        self.active_operations.discard("clone_repo")
+        self.set_button_loading(self.clone_repo_btn, False)
 
-        def on_add_remote_result(result):
-            self.log_message(result)
-            # 刷新分支信息以更新远程分支列表
-            self.refresh_branches()
-
-        def on_add_remote_error(error_msg):
-            self.log_message(f"添加远程仓库失败: {error_msg}")
-            QMessageBox.critical(self, "错误", f"添加远程仓库失败: {error_msg}")
-
-        # 执行添加远程仓库任务
-        worker = GitWorker(self.current_repo_path, "add_remote", remote_name, remote_url)
-        worker.signals.result.connect(on_add_remote_result)
-        worker.signals.error.connect(on_add_remote_error)
-        self.threadpool.start(worker)
+    def on_clone_error(self, error_msg):
+        """克隆失败回调"""
+        self.log_message(f"克隆失败: {error_msg}")
+        QMessageBox.critical(self, "克隆失败", f"克隆仓库时出错: {error_msg}")
+        self.active_operations.discard("clone_repo")
+        self.set_button_loading(self.clone_repo_btn, False)
 
     def delete_branch(self):
         """删除分支"""
